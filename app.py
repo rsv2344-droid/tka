@@ -1,4 +1,4 @@
-from flask import Flask, request, redirect, session, render_template_string, send_from_directory, Response
+from flask import Flask, request, redirect, session, render_template_string, send_from_directory, Response, jsonify
 import os
 from werkzeug.utils import secure_filename
 import secrets
@@ -11,16 +11,25 @@ from psycopg2.extras import RealDictCursor
 import requests as http_requests
 import cloudinary
 import cloudinary.uploader
+import hashlib
+import re
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
+# ============================================================
+# ADMIN CONFIG - Encrypted access
+# ============================================================
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
+ADMIN_PASS_HASH = os.environ.get("ADMIN_PASS_HASH", hashlib.sha256("admin123".encode()).hexdigest())
+
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp"}
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def verify_admin_password(password):
+    return hashlib.sha256(password.encode()).hexdigest() == ADMIN_PASS_HASH
 
 # ============================================================
 # CLOUDINARY CONFIG
@@ -38,11 +47,9 @@ cloudinary.config(
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 # FONT PATHS
-_BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-_FONTS_DIR   = os.path.join(_BASE_DIR, "fonts")
-FONT_REGULAR = os.path.join(_FONTS_DIR, "DejaVuSans.ttf")
-FONT_BOLD    = os.path.join(_FONTS_DIR, "DejaVuSans-Bold.ttf")
-FONT_MONO    = os.path.join(_FONTS_DIR, "DejaVuSansMono.ttf")
+FONT_REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+FONT_BOLD    = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+FONT_MONO    = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
 
 # ============================================================
 # POSTGRESQL DB FUNCTIONS
@@ -134,6 +141,13 @@ def init_db():
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS customers(
+        id SERIAL PRIMARY KEY,
+        phone TEXT UNIQUE NOT NULL,
+        name TEXT,
+        address TEXT,
+        created_at TEXT
+    )""")
     conn.commit()
     conn.close()
 
@@ -155,6 +169,7 @@ DEFAULT_SETTINGS = {
     "order_confirmed_msg":        "Thank you, we received your order.",
     "order_confirmed_redirect":   "Redirecting to the store...",
     "order_confirmed_back_btn":   "Back to Store",
+    "lang":                       "ar",
 }
 
 for k, v in DEFAULT_SETTINGS.items():
@@ -165,7 +180,7 @@ for k, v in DEFAULT_SETTINGS.items():
     conn.close()
 
 def get_setting(key):
-    row = q("SELECT value FROM settings WHERE key=?", (key,), one=True)
+    row = q("SELECT value FROM settings WHERE key=%s", (key,), one=True)
     return row["value"] if row else DEFAULT_SETTINGS.get(key, "")
 
 def get_all_settings():
@@ -173,13 +188,13 @@ def get_all_settings():
     return {r["key"]: r["value"] for r in rows}
 
 for migration in [
-    "ALTER TABLE categories ADD COLUMN parent_id INTEGER",
-    "ALTER TABLE categories ADD COLUMN sort_order INTEGER DEFAULT 0",
-    "ALTER TABLE categories ADD COLUMN card_size TEXT DEFAULT 'medium'",
-    "ALTER TABLE products ADD COLUMN sort_order INTEGER DEFAULT 0",
-    "ALTER TABLE products ADD COLUMN card_size TEXT DEFAULT 'medium'",
-    "ALTER TABLE orders ADD COLUMN latitude TEXT",
-    "ALTER TABLE orders ADD COLUMN longitude TEXT",
+    "ALTER TABLE categories ADD COLUMN IF NOT EXISTS parent_id INTEGER",
+    "ALTER TABLE categories ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0",
+    "ALTER TABLE categories ADD COLUMN IF NOT EXISTS card_size TEXT DEFAULT 'medium'",
+    "ALTER TABLE products ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0",
+    "ALTER TABLE products ADD COLUMN IF NOT EXISTS card_size TEXT DEFAULT 'medium'",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS latitude TEXT",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS longitude TEXT",
 ]:
     try:
         q(migration)
@@ -200,7 +215,6 @@ def save(file):
                 folder="store_uploads",
                 resource_type="image"
             )
-            # نحفظ فقط الـ public_id
             return result["public_id"]
         except Exception as e:
             print(f"Cloudinary upload error: {e}")
@@ -210,7 +224,6 @@ def save(file):
 def image_url(public_id):
     if not public_id:
         return ""
-    # نبني URL مباشرة
     cloud_name = os.environ.get("CLOUDINARY_CLOUD_NAME", "")
     return f"https://res.cloudinary.com/{cloud_name}/image/upload/{public_id}"
 
@@ -264,28 +277,12 @@ def generate_order_png(order):
     lon = (order.get("longitude") or "").strip()
     has_location = bool(lat and lon)
 
-    H = 80
-    H += 70
-    H += 20
-    H += 50
-    H += 10
-    H += 1
-    H += 16
-    H += 3 * 30
+    H = 80 + 70 + 20 + 50 + 10 + 1 + 16 + 3*30
     if notes:
         H += 30 + (len(note_lines) - 1) * 18
     if has_location:
         H += 30
-    H += 16
-    H += 1
-    H += 16
-    H += 24
-    H += 10
-    H += len(wrapped_items) * 20 + 10
-    H += 1
-    H += 16
-    H += 36
-    H += 36
+    H += 16 + 1 + 16 + 24 + 10 + len(wrapped_items) * 20 + 10 + 1 + 16 + 36 + 36
 
     img = Image.new("RGB", (W, H), WHITE)
     d   = ImageDraw.Draw(img)
@@ -352,54 +349,506 @@ def generate_order_png(order):
     buf.seek(0)
     return buf
 
+# ============================================================
+# TRANSLATIONS
+# ============================================================
+TRANSLATIONS = {
+    "ar": {
+        "categories": "Ø§Ù„Ø£Ù‚Ø³Ø§Ù…", "products": "Ø§Ù„Ù…Ù†ØªØ¬Ø§Øª", "cart": "Ø§Ù„Ø³Ù„Ø©",
+        "checkout": "Ø¥ØªÙ…Ø§Ù… Ø§Ù„Ø·Ù„Ø¨", "add_to_cart": "Ø£Ø¶Ù Ù„Ù„Ø³Ù„Ø©", "back": "Ø±Ø¬ÙˆØ¹",
+        "empty_cart": "Ø§Ù„Ø³Ù„Ø© ÙØ§Ø±ØºØ©", "browse": "ØªØµÙØ­ Ø§Ù„Ù…Ù†ØªØ¬Ø§Øª", "total": "Ø§Ù„Ù…Ø¬Ù…ÙˆØ¹",
+        "phone": "Ø±Ù‚Ù… Ø§Ù„Ù‡Ø§ØªÙ", "address": "Ø§Ù„Ø¹Ù†ÙˆØ§Ù†", "notes": "Ù…Ù„Ø§Ø­Ø¸Ø§Øª",
+        "confirm": "ØªØ£ÙƒÙŠØ¯ Ø§Ù„Ø·Ù„Ø¨", "order_confirmed": "ØªÙ… ØªØ£ÙƒÙŠØ¯ Ø§Ù„Ø·Ù„Ø¨!",
+        "thank_you": "Ø´ÙƒØ±Ø§Ù‹ Ù„ÙƒØŒ Ø§Ø³ØªÙ„Ù…Ù†Ø§ Ø·Ù„Ø¨Ùƒ.", "redirecting": "Ø¬Ø§Ø±ÙŠ Ø¥Ø¹Ø§Ø¯Ø© Ø§Ù„ØªÙˆØ¬ÙŠÙ‡...",
+        "back_to_store": "Ø§Ù„Ø¹ÙˆØ¯Ø© Ù„Ù„Ù…ØªØ¬Ø±", "login": "ØªØ³Ø¬ÙŠÙ„ Ø§Ù„Ø¯Ø®ÙˆÙ„", "register": "Ø¥Ù†Ø´Ø§Ø¡ Ø­Ø³Ø§Ø¨",
+        "logout": "ØªØ³Ø¬ÙŠÙ„ Ø§Ù„Ø®Ø±ÙˆØ¬", "my_orders": "Ø·Ù„Ø¨Ø§ØªÙŠ", "welcome": "Ù…Ø±Ø­Ø¨Ø§Ù‹",
+        "guest": "Ø²Ø§Ø¦Ø±", "qty": "Ø§Ù„ÙƒÙ…ÙŠØ©", "remove": "Ø­Ø°Ù", "continue_shopping": "Ù…ÙˆØ§ØµÙ„Ø© Ø§Ù„ØªØ³ÙˆÙ‚",
+        "customer_login": "ØªØ³Ø¬ÙŠÙ„ Ø¯Ø®ÙˆÙ„ Ø§Ù„Ø²Ø¨ÙˆÙ†", "customer_register": "Ø¥Ù†Ø´Ø§Ø¡ Ø­Ø³Ø§Ø¨ Ø²Ø¨ÙˆÙ†",
+        "name": "Ø§Ù„Ø§Ø³Ù…", "submit": "Ø¥Ø±Ø³Ø§Ù„", "have_account": "Ù„Ø¯ÙŠÙƒ Ø­Ø³Ø§Ø¨ØŸ",
+        "no_account": "Ù„ÙŠØ³ Ù„Ø¯ÙŠÙƒ Ø­Ø³Ø§Ø¨ØŸ", "create_one": "Ø£Ù†Ø´Ø¦ ÙˆØ§Ø­Ø¯Ø§Ù‹", "login_here": "Ø³Ø¬Ù„ Ø¯Ø®ÙˆÙ„ Ù‡Ù†Ø§",
+        "orders": "Ø§Ù„Ø·Ù„Ø¨Ø§Øª", "date": "Ø§Ù„ØªØ§Ø±ÙŠØ®", "status": "Ø§Ù„Ø­Ø§Ù„Ø©", "pending": "Ù‚ÙŠØ¯ Ø§Ù„Ø§Ù†ØªØ¸Ø§Ø±",
+        "completed": "Ù…ÙƒØªÙ…Ù„", "search": "Ø¨Ø­Ø«", "no_products": "Ù„Ø§ ØªÙˆØ¬Ø¯ Ù…Ù†ØªØ¬Ø§Øª",
+        "no_categories": "Ù„Ø§ ØªÙˆØ¬Ø¯ Ø£Ù‚Ø³Ø§Ù…", "price": "Ø§Ù„Ø³Ø¹Ø±", "each": "Ù„Ù„ÙˆØ§Ø­Ø¯",
+        "subtotal": "Ø§Ù„Ù…Ø¬Ù…ÙˆØ¹ Ø§Ù„ÙØ±Ø¹ÙŠ", "delete": "Ø­Ø°Ù", "edit": "ØªØ¹Ø¯ÙŠÙ„", "save": "Ø­ÙØ¸",
+        "cancel": "Ø¥Ù„ØºØ§Ø¡", "add": "Ø¥Ø¶Ø§ÙØ©", "category": "Ø§Ù„Ù‚Ø³Ù…", "product": "Ø§Ù„Ù…Ù†ØªØ¬",
+        "image": "Ø§Ù„ØµÙˆØ±Ø©", "optional": "Ø§Ø®ØªÙŠØ§Ø±ÙŠ", "required": "Ù…Ø·Ù„ÙˆØ¨", "success": "ØªÙ… Ø¨Ù†Ø¬Ø§Ø­",
+        "error": "Ø®Ø·Ø£", "loading": "Ø¬Ø§Ø±ÙŠ Ø§Ù„ØªØ­Ù…ÙŠÙ„...", "location": "Ø§Ù„Ù…ÙˆÙ‚Ø¹",
+        "detecting": "Ø¬Ø§Ø±ÙŠ ØªØ­Ø¯ÙŠØ¯ Ø§Ù„Ù…ÙˆÙ‚Ø¹...", "detected": "ØªÙ… ØªØ­Ø¯ÙŠØ¯ Ø§Ù„Ù…ÙˆÙ‚Ø¹",
+        "not_available": "Ø§Ù„Ù…ÙˆÙ‚Ø¹ ØºÙŠØ± Ù…ØªØ§Ø­", "not_supported": "Ø§Ù„Ù…ØªØµÙØ­ Ù„Ø§ ÙŠØ¯Ø¹Ù… ØªØ­Ø¯ÙŠØ¯ Ø§Ù„Ù…ÙˆÙ‚Ø¹",
+        "no_orders": "Ù„Ø§ ØªÙˆØ¬Ø¯ Ø·Ù„Ø¨Ø§Øª", "order_details": "ØªÙØ§ØµÙŠÙ„ Ø§Ù„Ø·Ù„Ø¨",
+    },
+    "en": {
+        "categories": "Categories", "products": "Products", "cart": "Cart",
+        "checkout": "Checkout", "add_to_cart": "Add to Cart", "back": "Back",
+        "empty_cart": "Your cart is empty", "browse": "Browse Products", "total": "Total",
+        "phone": "Phone Number", "address": "Address", "notes": "Notes",
+        "confirm": "Confirm Order", "order_confirmed": "Order Confirmed!",
+        "thank_you": "Thank you, we received your order.", "redirecting": "Redirecting to store...",
+        "back_to_store": "Back to Store", "login": "Login", "register": "Register",
+        "logout": "Logout", "my_orders": "My Orders", "welcome": "Welcome",
+        "guest": "Guest", "qty": "Qty", "remove": "Remove", "continue_shopping": "Continue Shopping",
+        "customer_login": "Customer Login", "customer_register": "Customer Registration",
+        "name": "Name", "submit": "Submit", "have_account": "Have an account?",
+        "no_account": "Don't have an account?", "create_one": "Create one", "login_here": "Login here",
+        "orders": "Orders", "date": "Date", "status": "Status", "pending": "Pending",
+        "completed": "Completed", "search": "Search", "no_products": "No products",
+        "no_categories": "No categories", "price": "Price", "each": "each",
+        "subtotal": "Subtotal", "delete": "Delete", "edit": "Edit", "save": "Save",
+        "cancel": "Cancel", "add": "Add", "category": "Category", "product": "Product",
+        "image": "Image", "optional": "Optional", "required": "Required", "success": "Success",
+        "error": "Error", "loading": "Loading...", "location": "Location",
+        "detecting": "Detecting location...", "detected": "Location detected",
+        "not_available": "Location not available", "not_supported": "Geolocation not supported",
+        "no_orders": "No orders yet", "order_details": "Order Details",
+    }
+}
+
+def t(key):
+    lang = get_setting("lang") or "ar"
+    return TRANSLATIONS.get(lang, TRANSLATIONS["ar"]).get(key, key)
+
+def get_dir():
+    lang = get_setting("lang") or "ar"
+    return "rtl" if lang == "ar" else "ltr"
 
 # ============================================================
-# MOBILE STORE FRONTEND
+# MOBILE STORE FRONTEND - MODERN DESIGN
 # ============================================================
 MOBILE_BASE = """<!DOCTYPE html>
-<html>
+<html lang="{{lang}}" dir="{{dir}}">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
 <style>
-* { box-sizing: border-box; }
-body { font-family: Arial, sans-serif; background: #f5f6fa; min-height: 100vh; padding-bottom: 100px; }
-.store-nav { background: #fff; padding: 14px 16px; display: flex; align-items: center; justify-content: space-between; box-shadow: 0 1px 8px rgba(0,0,0,0.08); position: sticky; top: 0; z-index: 100; }
-.store-nav .store-name { font-size: 18px; font-weight: 700; color: #111; text-decoration: none; }
-.nav-cart-btn { background: #111; color: #fff; border: none; border-radius: 50px; padding: 8px 16px; font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 6px; text-decoration: none; }
-.nav-cart-btn .badge { background: #e53935; color: #fff; border-radius: 50px; padding: 2px 7px; font-size: 11px; }
-.products-grid { display: grid; gap: 12px; padding: 14px; }
-.product-card { background: #fff; border-radius: 14px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.07); display: flex; flex-direction: column; text-decoration: none; color: inherit; }
-.product-card img { width: 100%; object-fit: cover; }
-.product-card .no-img { width: 100%; background: #eee; display: flex; align-items: center; justify-content: center; color: #aaa; font-size: 13px; }
-.product-card .card-info { padding: 10px 10px 12px; flex: 1; display: flex; flex-direction: column; gap: 6px; }
-.product-card .card-name { font-size: 13px; font-weight: 600; color: #111; }
-.product-card .card-price { font-size: 14px; font-weight: 700; color: #111; }
-.qty-controls { display: flex; align-items: center; background: #f0f0f0; border-radius: 50px; overflow: hidden; width: 100%; }
+:root {
+  --primary: #1a1a2e;
+  --primary-light: #16213e;
+  --accent: #4361ee;
+  --accent-hover: #3451c7;
+  --success: #10b981;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+  --bg: #f8fafc;
+  --card: #ffffff;
+  --text: #1e293b;
+  --text-muted: #64748b;
+  --border: #e2e8f0;
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+  --radius: 16px;
+  --radius-sm: 12px;
+  --radius-xs: 8px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: {{font_family}};
+  background: var(--bg);
+  min-height: 100vh;
+  padding-bottom: 100px;
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+.store-nav {
+  background: rgba(255,255,255,0.95);
+  padding: 14px 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  box-shadow: var(--shadow-sm);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+.store-nav .store-name {
+  font-size: 20px;
+  font-weight: 800;
+  color: var(--primary);
+  text-decoration: none;
+  letter-spacing: -0.5px;
+}
+.nav-cart-btn {
+  background: var(--primary);
+  color: #fff;
+  border: none;
+  border-radius: 50px;
+  padding: 10px 18px;
+  font-size: 14px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-decoration: none;
+  transition: all 0.2s ease;
+  box-shadow: var(--shadow);
+}
+.nav-cart-btn:hover { background: var(--primary-light); transform: translateY(-1px); }
+.nav-cart-btn .badge {
+  background: var(--danger);
+  color: #fff;
+  border-radius: 50px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.products-grid {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  grid-template-columns: repeat(2, 1fr);
+}
+.product-card {
+  background: var(--card);
+  border-radius: var(--radius);
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+  text-decoration: none;
+  color: inherit;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  border: 1px solid var(--border);
+}
+.product-card:hover {
+  transform: translateY(-4px);
+  box-shadow: var(--shadow-lg);
+  border-color: var(--accent);
+}
+.product-card img {
+  width: 100%;
+  object-fit: cover;
+  transition: transform 0.3s ease;
+}
+.product-card:hover img { transform: scale(1.05); }
+.product-card .no-img {
+  width: 100%;
+  background: linear-gradient(135deg, #f1f5f9 0%, #e2e8f0 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 500;
+}
+.product-card .card-info {
+  padding: 12px 12px 14px;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.product-card .card-name {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1.3;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.product-card .card-price {
+  font-size: 15px;
+  font-weight: 800;
+  color: var(--accent);
+}
+.qty-controls {
+  display: flex;
+  align-items: center;
+  background: #f1f5f9;
+  border-radius: 50px;
+  overflow: hidden;
+  width: 100%;
+  border: 1px solid var(--border);
+}
 .qty-controls form { flex: 1; }
-.qty-controls button { width: 100%; background: none; border: none; font-size: 18px; font-weight: 700; padding: 6px 0; color: #111; cursor: pointer; }
-.qty-controls .qty-num { font-size: 14px; font-weight: 700; color: #111; min-width: 28px; text-align: center; }
-.add-btn { width: 100%; background: #111; color: #fff; border: none; border-radius: 50px; padding: 8px 0; font-size: 13px; font-weight: 600; cursor: pointer; text-align: center; text-decoration: none; display: block; }
-.back-btn { display: inline-flex; align-items: center; gap: 6px; background: #fff; color: #333; font-size: 14px; font-weight: 600; text-decoration: none; padding: 10px 18px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.07); margin: 12px 14px 8px; }
-.section-title { display: inline-block; font-size: 15px; font-weight: 700; color: #333; background: #fff; padding: 10px 18px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.07); margin: 12px 14px 8px; }
-.cart-item { background: #fff; border-radius: 14px; padding: 14px; margin: 0 14px 10px; display: flex; align-items: center; gap: 12px; box-shadow: 0 1px 6px rgba(0,0,0,0.06); }
-.cart-item img { width: 60px; height: 60px; border-radius: 10px; object-fit: cover; flex-shrink: 0; }
-.cart-item .no-img-sm { width: 60px; height: 60px; border-radius: 10px; background: #eee; flex-shrink: 0; }
+.qty-controls button {
+  width: 100%;
+  background: none;
+  border: none;
+  font-size: 18px;
+  font-weight: 700;
+  padding: 8px 0;
+  color: var(--primary);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.qty-controls button:hover { background: #e2e8f0; }
+.qty-controls .qty-num {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  min-width: 32px;
+  text-align: center;
+}
+.add-btn {
+  width: 100%;
+  background: var(--primary);
+  color: #fff;
+  border: none;
+  border-radius: 50px;
+  padding: 10px 0;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  text-align: center;
+  text-decoration: none;
+  display: block;
+  transition: all 0.2s ease;
+  box-shadow: var(--shadow-sm);
+}
+.add-btn:hover { background: var(--primary-light); transform: translateY(-1px); }
+.back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--card);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+  padding: 10px 18px;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-sm);
+  margin: 12px 16px 8px;
+  border: 1px solid var(--border);
+  transition: all 0.2s ease;
+}
+.back-btn:hover { box-shadow: var(--shadow); transform: translateX(-2px); }
+.section-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 16px;
+  font-weight: 800;
+  color: var(--text);
+  background: var(--card);
+  padding: 12px 20px;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-sm);
+  margin: 12px 16px 8px;
+  border: 1px solid var(--border);
+}
+.cart-item {
+  background: var(--card);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin: 0 16px 12px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  box-shadow: var(--shadow-sm);
+  border: 1px solid var(--border);
+  transition: all 0.2s ease;
+}
+.cart-item:hover { box-shadow: var(--shadow); }
+.cart-item img {
+  width: 64px;
+  height: 64px;
+  border-radius: var(--radius-xs);
+  object-fit: cover;
+  flex-shrink: 0;
+}
+.cart-item .no-img-sm {
+  width: 64px;
+  height: 64px;
+  border-radius: var(--radius-xs);
+  background: linear-gradient(135deg, #f1f5f9 0%, #e2e8f0 100%);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 20px;
+}
 .cart-item .item-details { flex: 1; min-width: 0; }
-.cart-item .item-name { font-size: 14px; font-weight: 600; color: #111; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.cart-item .item-price { font-size: 13px; color: #555; margin-top: 2px; }
-.cart-item .item-subtotal { font-size: 14px; font-weight: 700; color: #111; }
-.qty-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
-.qty-row form button { width: 30px; height: 30px; border-radius: 50%; border: 1.5px solid #ddd; background: #fff; font-size: 16px; font-weight: 700; display: flex; align-items: center; justify-content: center; cursor: pointer; }
-.qty-row .qty-num { font-size: 14px; font-weight: 700; min-width: 20px; text-align: center; }
-.delete-btn { background: none; border: none; color: #e53935; font-size: 18px; cursor: pointer; padding: 4px; margin-left: auto; }
-.cart-footer { position: fixed; bottom: 0; left: 0; right: 0; background: #fff; padding: 14px 16px; box-shadow: 0 -2px 12px rgba(0,0,0,0.1); z-index: 200; }
-.cart-footer .total-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-.cart-footer .total-label { font-size: 15px; color: #555; }
-.cart-footer .total-val { font-size: 20px; font-weight: 700; color: #111; }
-.checkout-btn { display: block; width: 100%; background: #111; color: #fff; border: none; border-radius: 50px; padding: 14px; font-size: 16px; font-weight: 700; text-align: center; text-decoration: none; cursor: pointer; }
+.cart-item .item-name {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cart-item .item-price {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-top: 3px;
+  font-weight: 500;
+}
+.cart-item .item-subtotal {
+  font-size: 15px;
+  font-weight: 800;
+  color: var(--accent);
+}
+.qty-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+.qty-row form button {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border);
+  background: var(--card);
+  font-size: 16px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--text);
+  transition: all 0.15s;
+}
+.qty-row form button:hover { background: var(--bg); border-color: var(--accent); }
+.qty-row .qty-num {
+  font-size: 15px;
+  font-weight: 700;
+  min-width: 24px;
+  text-align: center;
+  color: var(--text);
+}
+.delete-btn {
+  background: none;
+  border: none;
+  color: var(--danger);
+  font-size: 20px;
+  cursor: pointer;
+  padding: 6px;
+  margin-left: auto;
+  border-radius: 50%;
+  transition: all 0.15s;
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.delete-btn:hover { background: #fef2f2; }
+.cart-footer {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: var(--card);
+  padding: 16px 18px;
+  box-shadow: 0 -4px 20px rgba(0,0,0,0.08);
+  z-index: 200;
+  border-top: 1px solid var(--border);
+}
+.cart-footer .total-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.cart-footer .total-label { font-size: 16px; color: var(--text-muted); font-weight: 500; }
+.cart-footer .total-val { font-size: 24px; font-weight: 800; color: var(--primary); }
+.checkout-btn {
+  display: block;
+  width: 100%;
+  background: var(--primary);
+  color: #fff;
+  border: none;
+  border-radius: 50px;
+  padding: 16px;
+  font-size: 17px;
+  font-weight: 700;
+  text-align: center;
+  text-decoration: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  box-shadow: var(--shadow);
+}
+.checkout-btn:hover { background: var(--primary-light); transform: translateY(-2px); }
+.lang-switcher {
+  position: fixed;
+  bottom: 90px;
+  {{lang_pos}}: 16px;
+  z-index: 150;
+  background: var(--card);
+  border-radius: 50px;
+  padding: 8px 16px;
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  text-decoration: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.2s ease;
+}
+.lang-switcher:hover { transform: scale(1.05); box-shadow: var(--shadow-lg); }
+.customer-menu {
+  position: fixed;
+  bottom: 140px;
+  {{lang_pos}}: 16px;
+  z-index: 150;
+  background: var(--card);
+  border-radius: var(--radius-sm);
+  padding: 8px;
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 140px;
+}
+.customer-menu a {
+  padding: 8px 12px;
+  border-radius: var(--radius-xs);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  text-decoration: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: all 0.15s;
+}
+.customer-menu a:hover { background: var(--bg); color: var(--accent); }
+.empty-state {
+  text-align: center;
+  padding: 80px 24px;
+}
+.empty-state-icon {
+  font-size: 64px;
+  margin-bottom: 16px;
+  opacity: 0.3;
+}
+.empty-state-text {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+.empty-state-sub {
+  font-size: 14px;
+  color: var(--text-muted);
+  margin-bottom: 24px;
+}
 {BG_STYLE}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.fade-in { animation: fadeIn 0.4s ease-out; }
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.slide-up { animation: slideUp 0.5s ease-out; }
 </style>
 </head>
 <body>
@@ -413,7 +862,7 @@ def get_cart_summary():
     total = 0.0
     qty = sum(counts.values())
     for prod_id, cnt in counts.items():
-        p = q("SELECT price FROM products WHERE id=?", (prod_id,), one=True)
+        p = q("SELECT price FROM products WHERE id=%s", (prod_id,), one=True)
         if p:
             total += float(p["price"]) * cnt
     return qty, total
@@ -423,24 +872,42 @@ def get_mobile_base():
     bg_style = ""
     if d and d["background"]:
         bg_url = image_url(d["background"])
-        bg_style = f"body::before {{ content: ''; position: fixed; top: 0; left: 0; right: 0; bottom: 0; width: 100%; height: 100%; background-image: url('{bg_url}'); background-size: cover; background-position: center; background-repeat: no-repeat; z-index: -1; }}"
-    return MOBILE_BASE.replace("{BG_STYLE}", bg_style)
+        bg_style = f"body::before {{ content: ''; position: fixed; top: 0; left: 0; right: 0; bottom: 0; width: 100%; height: 100%; background-image: url('{bg_url}'); background-size: cover; background-position: center; background-repeat: no-repeat; z-index: -1; opacity: 0.15; }}"
+    lang = get_setting("lang") or "ar"
+    dir_ = "rtl" if lang == "ar" else "ltr"
+    font_family = "'Tajawal', 'Inter', sans-serif" if lang == "ar" else "'Inter', 'Tajawal', sans-serif"
+    lang_pos = "left" if lang == "ar" else "right"
+    return MOBILE_BASE.replace("{BG_STYLE}", bg_style).replace("{{lang}}", lang).replace("{{dir}}", dir_).replace("{{font_family}}", font_family).replace("{{lang_pos}}", lang_pos)
 
 def get_navbar(cart_qty=0, cart_total=0):
     store_name = get_setting("store_name")
     cart_label = get_setting("cart_btn_label")
     badge = f'<span class="badge">{cart_qty}</span>' if cart_qty > 0 else ""
     total_str = f" &middot; {int(cart_total)}" if cart_qty > 0 else ""
-    return f"""
+    return f'''
     <nav class="store-nav">
         <a href="/" class="store-name">{store_name}</a>
         <a href="/cart" class="nav-cart-btn">{cart_label}{total_str} {badge}</a>
-    </nav>"""
+    </nav>'''
+
+def get_customer_menu():
+    customer = session.get("customer")
+    if customer:
+        return f'''
+        <div class="customer-menu">
+            <a href="/customer/orders"><span>&#128203;</span> {t("my_orders")}</a>
+            <a href="/customer/logout"><span>&#128682;</span> {t("logout")}</a>
+        </div>'''
+    return f'''
+    <div class="customer-menu">
+        <a href="/customer/login"><span>&#128100;</span> {t("login")}</a>
+        <a href="/customer/register"><span>&#128221;</span> {t("register")}</a>
+    </div>'''
 
 def render_grid(items, href_fn, action_fn, size_field="card_size"):
     if not items:
         return ""
-    html = '<div style="display:grid;gap:12px;padding:14px;grid-template-columns:repeat(2,1fr);">'
+    html = '<div class="products-grid fade-in">'
     for row in items:
         item = dict(row)
         size = item.get(size_field, "medium") or "medium"
@@ -451,7 +918,7 @@ def render_grid(items, href_fn, action_fn, size_field="card_size"):
         action = action_fn(item) if action_fn else ""
         item_image = item.get("image")
         img_src = image_url(item_image) if item_image else ""
-        img_html = f'<img src="{img_src}" style="width:100%;height:{height};object-fit:cover;" alt="">' if item_image else f'<div class="no-img" style="height:{height};">No Image</div>'
+        img_html = f'<img src="{img_src}" style="width:100%;height:{height};object-fit:cover;" alt="" loading="lazy">' if item_image else f'<div class="no-img" style="height:{height};"><span>&#128247;</span></div>'
         name = item.get("name", "")
         item_price = item.get("price")
         price_html = f'<div class="card-price">{int(item_price)}</div>' if item_price is not None else ""
@@ -470,19 +937,32 @@ def home():
     base = get_mobile_base()
     qty, total = get_cart_summary()
     navbar = get_navbar(qty, total)
+    lang_switch = f'<a href="/switch_lang" class="lang-switcher">&#127760; {"EN" if get_setting("lang") == "ar" else "AR"}</a>'
+    customer_menu = get_customer_menu()
     if cats:
         cats_html = render_grid(cats, href_fn=lambda c: f"/category/{c['id']}", action_fn=None)
     else:
-        cats_html = '<p class="text-muted px-3">No categories yet.</p>'
-    return base + navbar + f'<p class="section-title mt-3">Categories</p>{cats_html}<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script></body></html>'
+        cats_html = f'<div class="empty-state"><div class="empty-state-icon">&#128193;</div><div class="empty-state-text">{t("no_categories")}</div></div>'
+    return base + navbar + lang_switch + customer_menu + f'<div class="slide-up"><p class="section-title">&#128193; {t("categories")}</p>{cats_html}</div><script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script></body></html>'
+
+@app.route("/switch_lang")
+def switch_lang():
+    current = get_setting("lang") or "ar"
+    new_lang = "en" if current == "ar" else "ar"
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO settings(key, value) VALUES(%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", ("lang", new_lang))
+    conn.commit()
+    conn.close()
+    return redirect("/")
 
 @app.route("/category/<int:id>")
 def category(id):
-    cat = q("SELECT * FROM categories WHERE id=?", (id,), one=True)
+    cat = q("SELECT * FROM categories WHERE id=%s", (id,), one=True)
     if not cat:
-        return "<h3>Category not found.</h3><a href='/'>Back</a>", 404
-    subcats = q("SELECT * FROM categories WHERE parent_id=? ORDER BY sort_order ASC, id ASC", (id,))
-    prods = q("SELECT * FROM products WHERE category_id=? ORDER BY sort_order ASC, id ASC", (id,))
+        return f"<h3>{t('error')}</h3><a href='/'>{t('back')}</a>", 404
+    subcats = q("SELECT * FROM categories WHERE parent_id=%s ORDER BY sort_order ASC, id ASC", (id,))
+    prods = q("SELECT * FROM products WHERE category_id=%s ORDER BY sort_order ASC, id ASC", (id,))
     base = get_mobile_base()
     qty, total = get_cart_summary()
     navbar = get_navbar(qty, total)
@@ -497,17 +977,18 @@ def category(id):
         pid = p["id"]
         if cnt > 0:
             return f'<div class="qty-controls"><form method="post" action="/cart/remove/{pid}?next=/category/{id}"><button>-</button></form><span class="qty-num">{cnt}</span><form method="post" action="/cart/add_one/{pid}?next=/category/{id}"><button>+</button></form></div>'
-        return f'<a href="/add/{pid}" class="add-btn">Add to Cart</a>'
+        return f'<a href="/add/{pid}" class="add-btn">{t("add_to_cart")}</a>'
 
     prods_html = render_grid(prods, href_fn=None, action_fn=prod_action) if prods else (
-        '<p class="text-muted px-3">No products in this category.</p>' if not subcats else ""
+        f'<div class="empty-state"><div class="empty-state-icon">&#128230;</div><div class="empty-state-text">{t("no_products")}</div></div>' if not subcats else ""
     )
     sections = subcats_html + prods_html
-    return base + navbar + f'<a href="{back_url}" class="back-btn">&larr; Back</a><p class="section-title">{cat["name"]}</p>{sections}<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script></body></html>'
+    lang_switch = f'<a href="/switch_lang" class="lang-switcher">&#127760; {"EN" if get_setting("lang") == "ar" else "AR"}</a>'
+    return base + navbar + lang_switch + f'<a href="{back_url}" class="back-btn">&#8592; {t("back")}</a><div class="slide-up"><p class="section-title">&#128193; {cat["name"]}</p>{sections}</div><script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script></body></html>'
 
 @app.route("/add/<int:id>")
 def add(id):
-    product = q("SELECT id, category_id FROM products WHERE id=?", (id,), one=True)
+    product = q("SELECT id, category_id FROM products WHERE id=%s", (id,), one=True)
     if not product:
         return redirect("/")
     cart = session.get("cart", [])
@@ -524,7 +1005,7 @@ def cart():
     items = []
     total = 0.0
     for prod_id, cnt in counts.items():
-        p = q("SELECT * FROM products WHERE id=?", (prod_id,), one=True)
+        p = q("SELECT * FROM products WHERE id=%s", (prod_id,), one=True)
         if p:
             subtotal = float(p["price"]) * cnt
             items.append({"id": prod_id, "name": p["name"], "price": p["price"], "image": p["image"], "qty": cnt, "subtotal": subtotal})
@@ -532,14 +1013,15 @@ def cart():
     base = get_mobile_base()
     qty_total, _ = get_cart_summary()
     navbar = get_navbar(qty_total, total)
+    lang_switch = f'<a href="/switch_lang" class="lang-switcher">&#127760; {"EN" if get_setting("lang") == "ar" else "AR"}</a>'
     if not items:
-        return base + navbar + '<div style="text-align:center;padding:60px 20px;"><div style="font-size:60px;">&#128722;</div><p style="font-size:17px;font-weight:600;margin-top:12px;">Your cart is empty</p><a href="/" class="checkout-btn" style="display:inline-block;width:auto;padding:12px 32px;margin-top:16px;">Browse Products</a></div><script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script></body></html>'
+        return base + navbar + lang_switch + f'<div class="empty-state"><div class="empty-state-icon">&#128722;</div><div class="empty-state-text">{t("empty_cart")}</div><div class="empty-state-sub">{t("browse")}</div><a href="/" class="checkout-btn" style="display:inline-block;width:auto;padding:14px 36px;margin-top:8px;">{t("browse")}</a></div><script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script></body></html>'
     items_html = ""
     for i in items:
         img_src = image_url(i["image"]) if i["image"] else ""
-        img = f'<img src="{img_src}" alt="">' if i["image"] else '<div class="no-img-sm"></div>'
-        items_html += f'<div class="cart-item">{img}<div class="item-details"><div class="item-name">{i["name"]}</div><div class="item-price">{int(i["price"])} each</div><div class="qty-row"><form method="post" action="/cart/remove/{i["id"]}"><button>-</button></form><span class="qty-num">{i["qty"]}</span><form method="post" action="/cart/add_one/{i["id"]}"><button>+</button></form><span class="item-subtotal">{int(i["subtotal"])}</span><form method="post" action="/cart/delete/{i["id"]}" style="margin-left:auto"><button class="delete-btn">&#128465;</button></form></div></div></div>'
-    return base + navbar + f'<a href="/" class="back-btn">&larr; Continue Shopping</a><p class="section-title">My Cart</p><div style="margin-top:8px;">{items_html}</div><div class="cart-footer"><div class="total-row"><span class="total-label">Total</span><span class="total-val">{int(total)}</span></div><a href="/checkout" class="checkout-btn">Checkout &rarr;</a></div><script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script></body></html>'
+        img = f'<img src="{img_src}" alt="" loading="lazy">' if i["image"] else '<div class="no-img-sm"><span>&#128247;</span></div>'
+        items_html += f'<div class="cart-item">{img}<div class="item-details"><div class="item-name">{i["name"]}</div><div class="item-price">{int(i["price"])} {t("each")}</div><div class="qty-row"><form method="post" action="/cart/remove/{i["id"]}"><button>-</button></form><span class="qty-num">{i["qty"]}</span><form method="post" action="/cart/add_one/{i["id"]}"><button>+</button></form><span class="item-subtotal">{int(i["subtotal"])}</span><form method="post" action="/cart/delete/{i["id"]}" style="margin-left:auto"><button class="delete-btn">&#128465;</button></form></div></div></div>'
+    return base + navbar + lang_switch + f'<a href="/" class="back-btn">&#8592; {t("continue_shopping")}</a><div class="slide-up"><p class="section-title">&#128722; {t("cart")}</p><div style="margin-top:8px;">{items_html}</div></div><div class="cart-footer"><div class="total-row"><span class="total-label">{t("total")}</span><span class="total-val">{int(total)}</span></div><a href="/checkout" class="checkout-btn">{t("checkout")} &rarr;</a></div><script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script></body></html>'
 
 @app.route("/cart/remove/<int:prod_id>", methods=["POST"])
 def cart_remove(prod_id):
@@ -551,7 +1033,7 @@ def cart_remove(prod_id):
 
 @app.route("/cart/add_one/<int:prod_id>", methods=["POST"])
 def cart_add_one(prod_id):
-    if q("SELECT id FROM products WHERE id=?", (prod_id,), one=True):
+    if q("SELECT id FROM products WHERE id=%s", (prod_id,), one=True):
         cart = session.get("cart", [])
         cart.append(prod_id)
         session["cart"] = cart
@@ -563,17 +1045,149 @@ def cart_delete(prod_id):
     return redirect("/cart")
 
 # ============================================================
+# CUSTOMER AUTH
+# ============================================================
+@app.route("/customer/login", methods=["GET", "POST"])
+def customer_login():
+    error = None
+    if request.method == "POST":
+        phone = request.form.get("phone", "").strip()
+        if phone:
+            customer = q("SELECT * FROM customers WHERE phone=%s", (phone,), one=True)
+            if customer:
+                session["customer"] = dict(customer)
+                return redirect("/")
+            else:
+                error = t("error")
+    base = get_mobile_base()
+    return base + f'''
+    <div style="min-height:100vh;padding:24px;display:flex;flex-direction:column;justify-content:center;align-items:center;">
+        <div style="width:100%;max-width:380px;">
+            <div style="text-align:center;margin-bottom:32px;">
+                <div style="font-size:48px;margin-bottom:12px;">&#128100;</div>
+                <h2 style="font-size:22px;font-weight:800;color:var(--primary);">{t("customer_login")}</h2>
+            </div>
+            {"<div class='alert alert-danger' style='border-radius:12px;margin-bottom:16px;'>" + error + "</div>" if error else ""}
+            <form method="post" style="display:flex;flex-direction:column;gap:16px;">
+                <div>
+                    <label style="font-size:13px;font-weight:700;color:var(--text-muted);display:block;margin-bottom:6px;">{t("phone")} *</label>
+                    <input type="tel" name="phone" required style="width:100%;padding:14px 16px;border:2px solid var(--border);border-radius:var(--radius-sm);font-size:15px;outline:none;transition:border-color 0.2s;" placeholder="{t("phone")}">
+                </div>
+                <button type="submit" style="width:100%;background:var(--primary);color:#fff;border:none;border-radius:50px;padding:16px;font-size:16px;font-weight:700;cursor:pointer;transition:all 0.2s;box-shadow:var(--shadow);">{t("login")}</button>
+            </form>
+            <div style="text-align:center;margin-top:20px;font-size:14px;color:var(--text-muted);">
+                {t("no_account")} <a href="/customer/register" style="color:var(--accent);font-weight:700;text-decoration:none;">{t("create_one")}</a>
+            </div>
+            <div style="text-align:center;margin-top:12px;">
+                <a href="/" style="color:var(--text-muted);font-size:13px;text-decoration:none;">{t("back_to_store")}</a>
+            </div>
+        </div>
+    </div>
+    </body></html>'''
+
+@app.route("/customer/register", methods=["GET", "POST"])
+def customer_register():
+    error = None
+    if request.method == "POST":
+        phone = request.form.get("phone", "").strip()
+        name = request.form.get("name", "").strip()
+        address = request.form.get("address", "").strip()
+        if phone and name:
+            existing = q("SELECT id FROM customers WHERE phone=%s", (phone,), one=True)
+            if existing:
+                error = "Phone already registered"
+            else:
+                q("INSERT INTO customers(phone, name, address, created_at) VALUES(%s,%s,%s,%s)",
+                  (phone, name, address, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                customer = q("SELECT * FROM customers WHERE phone=%s", (phone,), one=True)
+                session["customer"] = dict(customer)
+                return redirect("/")
+    base = get_mobile_base()
+    return base + f'''
+    <div style="min-height:100vh;padding:24px;display:flex;flex-direction:column;justify-content:center;align-items:center;">
+        <div style="width:100%;max-width:380px;">
+            <div style="text-align:center;margin-bottom:32px;">
+                <div style="font-size:48px;margin-bottom:12px;">&#128221;</div>
+                <h2 style="font-size:22px;font-weight:800;color:var(--primary);">{t("customer_register")}</h2>
+            </div>
+            {"<div class='alert alert-danger' style='border-radius:12px;margin-bottom:16px;'>" + error + "</div>" if error else ""}
+            <form method="post" style="display:flex;flex-direction:column;gap:16px;">
+                <div>
+                    <label style="font-size:13px;font-weight:700;color:var(--text-muted);display:block;margin-bottom:6px;">{t("name")} *</label>
+                    <input type="text" name="name" required style="width:100%;padding:14px 16px;border:2px solid var(--border);border-radius:var(--radius-sm);font-size:15px;outline:none;" placeholder="{t("name")}">
+                </div>
+                <div>
+                    <label style="font-size:13px;font-weight:700;color:var(--text-muted);display:block;margin-bottom:6px;">{t("phone")} *</label>
+                    <input type="tel" name="phone" required style="width:100%;padding:14px 16px;border:2px solid var(--border);border-radius:var(--radius-sm);font-size:15px;outline:none;" placeholder="{t("phone")}">
+                </div>
+                <div>
+                    <label style="font-size:13px;font-weight:700;color:var(--text-muted);display:block;margin-bottom:6px;">{t("address")}</label>
+                    <input type="text" name="address" style="width:100%;padding:14px 16px;border:2px solid var(--border);border-radius:var(--radius-sm);font-size:15px;outline:none;" placeholder="{t("address")}">
+                </div>
+                <button type="submit" style="width:100%;background:var(--primary);color:#fff;border:none;border-radius:50px;padding:16px;font-size:16px;font-weight:700;cursor:pointer;transition:all 0.2s;box-shadow:var(--shadow);">{t("register")}</button>
+            </form>
+            <div style="text-align:center;margin-top:20px;font-size:14px;color:var(--text-muted);">
+                {t("have_account")} <a href="/customer/login" style="color:var(--accent);font-weight:700;text-decoration:none;">{t("login_here")}</a>
+            </div>
+            <div style="text-align:center;margin-top:12px;">
+                <a href="/" style="color:var(--text-muted);font-size:13px;text-decoration:none;">{t("back_to_store")}</a>
+            </div>
+        </div>
+    </div>
+    </body></html>'''
+
+@app.route("/customer/logout")
+def customer_logout():
+    session.pop("customer", None)
+    return redirect("/")
+
+@app.route("/customer/orders")
+def customer_orders():
+    customer = session.get("customer")
+    if not customer:
+        return redirect("/customer/login")
+    orders = q("SELECT * FROM orders WHERE phone=%s ORDER BY id DESC", (customer.get("phone"),))
+    base = get_mobile_base()
+    qty, total = get_cart_summary()
+    navbar = get_navbar(qty, total)
+    lang_switch = f'<a href="/switch_lang" class="lang-switcher">&#127760; {"EN" if get_setting("lang") == "ar" else "AR"}</a>'
+
+    orders_html = ""
+    if orders:
+        for o in orders:
+            lat = o.get("latitude") or ""
+            lon = o.get("longitude") or ""
+            map_link = f'<a href="https://www.google.com/maps?q={lat},{lon}" target="_blank" style="color:var(--accent);font-size:12px;font-weight:600;text-decoration:none;">&#128205; Map</a>' if lat and lon else ""
+            orders_html += f'''
+            <div class="cart-item" style="flex-direction:column;align-items:flex-start;gap:8px;">
+                <div style="display:flex;justify-content:space-between;width:100%;align-items:center;">
+                    <span style="font-size:14px;font-weight:800;color:var(--primary);">#{o["id"]}</span>
+                    <span style="font-size:12px;color:var(--text-muted);">{o["created_at"]}</span>
+                </div>
+                <div style="font-size:13px;color:var(--text);white-space:pre-line;width:100%;line-height:1.6;">{o["items"]}</div>
+                <div style="display:flex;justify-content:space-between;width:100%;align-items:center;margin-top:4px;">
+                    <span style="font-size:16px;font-weight:800;color:var(--accent);">{int(o["total"])}</span>
+                    {map_link}
+                </div>
+            </div>'''
+    else:
+        orders_html = f'<div class="empty-state"><div class="empty-state-icon">&#128203;</div><div class="empty-state-text">{t("no_orders")}</div></div>'
+
+    return base + navbar + lang_switch + f'<a href="/" class="back-btn">&#8592; {t("back_to_store")}</a><div class="slide-up"><p class="section-title">&#128203; {t("my_orders")}</p>{orders_html}</div><script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script></body></html>'
+
+# ============================================================
 # CHECKOUT
 # ============================================================
 @app.route("/checkout", methods=["GET", "POST"])
 def checkout():
     s = get_all_settings()
+    customer = session.get("customer")
     if request.method == "POST":
-        phone   = request.form.get("phone",   "").strip()
+        phone   = request.form.get("phone", "").strip()
         address = request.form.get("address", "").strip()
         details = request.form.get("details", "").strip()
-        lat     = request.form.get("lat",     "").strip()
-        lon     = request.form.get("lon",     "").strip()
+        lat     = request.form.get("lat", "").strip()
+        lon     = request.form.get("lon", "").strip()
         if not phone or not address:
             return redirect("/checkout")
         ids = session.get("cart", [])
@@ -583,14 +1197,14 @@ def checkout():
         lines = []
         total = 0.0
         for prod_id, cnt in counts.items():
-            p = q("SELECT * FROM products WHERE id=?", (prod_id,), one=True)
+            p = q("SELECT * FROM products WHERE id=%s", (prod_id,), one=True)
             if p:
                 subtotal = float(p["price"]) * cnt
                 total += subtotal
-                cat = q("SELECT name FROM categories WHERE id=?", (p["category_id"],), one=True)
+                cat = q("SELECT name FROM categories WHERE id=%s", (p["category_id"],), one=True)
                 cat_name = cat["name"] if cat else "-"
                 lines.append(f"{p['name']} ({cat_name}) x {cnt} = {subtotal:.0f}")
-        q("INSERT INTO orders(created_at, phone, address, details, items, total, latitude, longitude) VALUES(?,?,?,?,?,?,?,?)",
+        q("INSERT INTO orders(created_at, phone, address, details, items, total, latitude, longitude) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)",
           (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), phone, address, details,
            "\n".join(lines), total, lat or None, lon or None))
         session["cart"] = []
@@ -600,6 +1214,8 @@ def checkout():
         return redirect("/cart")
 
     base = get_mobile_base()
+    default_phone = customer.get("phone", "") if customer else ""
+    default_address = customer.get("address", "") if customer else ""
 
     geo_script = """
 <script>
@@ -609,48 +1225,48 @@ def checkout():
   var geoStatus = document.getElementById('geo-status');
   function setStatus(msg, color){ if(geoStatus){ geoStatus.textContent = msg; geoStatus.style.color = color; } }
   if(navigator.geolocation){
-    setStatus('Detecting location...', '#888');
+    setStatus('""" + t("detecting") + """', '#888');
     navigator.geolocation.getCurrentPosition(
-      function(pos){ latField.value = pos.coords.latitude.toFixed(7); lonField.value = pos.coords.longitude.toFixed(7); setStatus('Location detected \u2713', '#2ecc71'); },
-      function(err){ setStatus('Location not available', '#e53935'); },
+      function(pos){ latField.value = pos.coords.latitude.toFixed(7); lonField.value = pos.coords.longitude.toFixed(7); setStatus('""" + t("detected") + """ \u2713', '#10b981'); },
+      function(err){ setStatus('""" + t("not_available") + """', '#ef4444'); },
       { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
     );
-  } else { setStatus('Geolocation not supported', '#e53935'); }
+  } else { setStatus('""" + t("not_supported") + """', '#ef4444'); }
 })();
 </script>
 """
 
-    geo_ui = """
-<div style="display:flex;align-items:center;gap:8px;background:#f8f8f8;border:1.5px solid #eee;border-radius:12px;padding:11px 14px;margin-top:4px;">
-  <span style="font-size:20px;">&#128205;</span>
-  <span id="geo-status" style="font-size:13px;color:#888;font-weight:600;">Waiting for location...</span>
+    geo_ui = f"""
+<div style="display:flex;align-items:center;gap:10px;background:#f8fafc;border:2px solid var(--border);border-radius:var(--radius-sm);padding:12px 16px;margin-top:6px;">
+  <span style="font-size:22px;">&#128205;</span>
+  <span id="geo-status" style="font-size:13px;color:var(--text-muted);font-weight:600;">{t("detecting")}</span>
 </div>
 <input type="hidden" name="lat" id="lat" value="">
 <input type="hidden" name="lon" id="lon" value="">
 """
 
     return base + f"""
-<div style="min-height:100vh;padding:20px;">
-  <a href="/cart" class="back-btn" style="margin:0 0 20px;">&larr; {s.get('checkout_back_btn','Back to Cart')}</a>
-  <h2 style="font-size:20px;font-weight:700;margin-bottom:20px;">{s.get('checkout_title','Complete Your Order')}</h2>
-  <form method="post" style="display:flex;flex-direction:column;gap:14px;">
+<div style="min-height:100vh;padding:24px;max-width:480px;margin:0 auto;">
+  <a href="/cart" class="back-btn" style="margin:0 0 24px;">&#8592; {s.get('checkout_back_btn',t('back'))}</a>
+  <h2 style="font-size:22px;font-weight:800;margin-bottom:24px;color:var(--primary);">{s.get('checkout_title',t('checkout'))}</h2>
+  <form method="post" style="display:flex;flex-direction:column;gap:16px;">
     <div>
-      <label style="font-size:13px;font-weight:600;color:#555;display:block;margin-bottom:6px;">{s.get('checkout_phone_label','Phone Number *')}</label>
-      <input type="tel" name="phone" required style="width:100%;padding:13px 14px;border:1.5px solid #ddd;border-radius:12px;font-size:15px;outline:none;" placeholder="{s.get('checkout_phone_placeholder','e.g. 0912345678')}">
+      <label style="font-size:13px;font-weight:700;color:var(--text-muted);display:block;margin-bottom:6px;">{s.get('checkout_phone_label',t('phone'))} *</label>
+      <input type="tel" name="phone" required value="{default_phone}" style="width:100%;padding:14px 16px;border:2px solid var(--border);border-radius:var(--radius-sm);font-size:15px;outline:none;transition:border-color 0.2s;" placeholder="{s.get('checkout_phone_placeholder','')}">
     </div>
     <div>
-      <label style="font-size:13px;font-weight:600;color:#555;display:block;margin-bottom:6px;">{s.get('checkout_address_label','Delivery Address *')}</label>
-      <input type="text" name="address" required style="width:100%;padding:13px 14px;border:1.5px solid #ddd;border-radius:12px;font-size:15px;outline:none;" placeholder="{s.get('checkout_address_placeholder','Street, Building, Area...')}">
+      <label style="font-size:13px;font-weight:700;color:var(--text-muted);display:block;margin-bottom:6px;">{s.get('checkout_address_label',t('address'))} *</label>
+      <input type="text" name="address" required value="{default_address}" style="width:100%;padding:14px 16px;border:2px solid var(--border);border-radius:var(--radius-sm);font-size:15px;outline:none;transition:border-color 0.2s;" placeholder="{s.get('checkout_address_placeholder','')}">
     </div>
     <div>
-      <label style="font-size:13px;font-weight:600;color:#555;display:block;margin-bottom:6px;">{s.get('checkout_notes_label','Additional Notes (optional)')}</label>
-      <textarea name="details" rows="3" style="width:100%;padding:13px 14px;border:1.5px solid #ddd;border-radius:12px;font-size:15px;outline:none;resize:none;" placeholder="{s.get('checkout_notes_placeholder','Any special instructions...')}"></textarea>
+      <label style="font-size:13px;font-weight:700;color:var(--text-muted);display:block;margin-bottom:6px;">{s.get('checkout_notes_label',t('notes'))}</label>
+      <textarea name="details" rows="3" style="width:100%;padding:14px 16px;border:2px solid var(--border);border-radius:var(--radius-sm);font-size:15px;outline:none;resize:none;transition:border-color 0.2s;" placeholder="{s.get('checkout_notes_placeholder','')}"></textarea>
     </div>
     <div>
-      <label style="font-size:13px;font-weight:600;color:#555;display:block;margin-bottom:6px;">&#128205; Your Location</label>
+      <label style="font-size:13px;font-weight:700;color:var(--text-muted);display:block;margin-bottom:6px;">&#128205; {t('location')}</label>
       {geo_ui}
     </div>
-    <button type="submit" style="width:100%;background:#111;color:#fff;border:none;border-radius:50px;padding:15px;font-size:16px;font-weight:700;margin-top:6px;cursor:pointer;">{s.get('checkout_confirm_btn','Confirm Order')}</button>
+    <button type="submit" style="width:100%;background:var(--primary);color:#fff;border:none;border-radius:50px;padding:16px;font-size:17px;font-weight:700;margin-top:6px;cursor:pointer;transition:all 0.2s;box-shadow:var(--shadow);">{s.get('checkout_confirm_btn',t('confirm'))}</button>
   </form>
 </div>
 {geo_script}
@@ -659,20 +1275,22 @@ def checkout():
 @app.route("/order_confirmed")
 def order_confirmed():
     s = get_all_settings()
-    title     = s.get('order_confirmed_title',    'Order Confirmed!')
-    msg       = s.get('order_confirmed_msg',      'Thank you, we received your order.')
-    redir_msg = s.get('order_confirmed_redirect', 'Redirecting to the store...')
-    back_btn  = s.get('order_confirmed_back_btn', 'Back to Store')
-    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"><meta http-equiv="refresh" content="4;url=/"><style>body{{font-family:Arial,sans-serif;background:#f5f6fa;}}</style></head><body><div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;"><div style="text-align:center;"><div style="font-size:70px;">&#9989;</div><h2 style="font-size:22px;font-weight:700;margin-top:16px;">{title}</h2><p style="color:#555;font-size:15px;">{msg}</p><p style="color:#999;font-size:13px;margin-top:6px;">{redir_msg}</p><a href="/" style="display:inline-block;margin-top:20px;background:#111;color:#fff;border-radius:50px;padding:13px 32px;font-size:15px;font-weight:600;text-decoration:none;">{back_btn}</a></div></div></body></html>"""
+    title     = s.get('order_confirmed_title',    t('order_confirmed'))
+    msg       = s.get('order_confirmed_msg',      t('thank_you'))
+    redir_msg = s.get('order_confirmed_redirect', t('redirecting'))
+    back_btn  = s.get('order_confirmed_back_btn', t('back_to_store'))
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"><meta http-equiv="refresh" content="4;url=/"><style>body{{font-family:Arial,sans-serif;background:#f8fafc;}}</style></head><body><div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;"><div style="text-align:center;"><div style="font-size:70px;">&#9989;</div><h2 style="font-size:22px;font-weight:700;margin-top:16px;">{title}</h2><p style="color:#555;font-size:15px;">{msg}</p><p style="color:#999;font-size:13px;margin-top:6px;">{redir_msg}</p><a href="/" style="display:inline-block;margin-top:20px;background:var(--primary);color:#fff;border-radius:50px;padding:13px 32px;font-size:15px;font-weight:600;text-decoration:none;">{back_btn}</a></div></div></body></html>"""
 
 # ============================================================
-# ADMIN LOGIN
+# ADMIN LOGIN - ENCRYPTED
 # ============================================================
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
     error = None
     if request.method == "POST":
-        if request.form.get("u") == ADMIN_USER and request.form.get("p") == ADMIN_PASS:
+        u = request.form.get("u", "").strip()
+        p = request.form.get("p", "").strip()
+        if u == ADMIN_USER and verify_admin_password(p):
             session["admin"] = True
             return redirect("/dashboard")
         error = "Invalid username or password."
@@ -720,7 +1338,7 @@ def api_reorder_cats():
         return {"ok": False}, 403
     data = request.get_json()
     for item in data.get("order", []):
-        q("UPDATE categories SET sort_order=? WHERE id=?", (item["order"], item["id"]))
+        q("UPDATE categories SET sort_order=%s WHERE id=%s", (item["order"], item["id"]))
     return {"ok": True}
 
 @app.route("/api/reorder_prods", methods=["POST"])
@@ -729,7 +1347,7 @@ def api_reorder_prods():
         return {"ok": False}, 403
     data = request.get_json()
     for item in data.get("order", []):
-        q("UPDATE products SET sort_order=? WHERE id=?", (item["order"], item["id"]))
+        q("UPDATE products SET sort_order=%s WHERE id=%s", (item["order"], item["id"]))
     return {"ok": True}
 
 @app.route("/api/set_size", methods=["POST"])
@@ -743,9 +1361,9 @@ def api_set_size():
     if size not in ("small", "medium", "large"):
         return {"ok": False, "error": "invalid size"}, 400
     if kind == "cat":
-        q("UPDATE categories SET card_size=? WHERE id=?", (size, id_))
+        q("UPDATE categories SET card_size=%s WHERE id=%s", (size, id_))
     elif kind == "prod":
-        q("UPDATE products SET card_size=? WHERE id=?", (size, id_))
+        q("UPDATE products SET card_size=%s WHERE id=%s", (size, id_))
     else:
         return {"ok": False}, 400
     return {"ok": True}
@@ -755,33 +1373,34 @@ def api_set_size():
 # ============================================================
 SETTINGS_FIELDS = [
     {
-        "section": "المتجر العام",
+        "section": "Ø§Ù„Ù…ØªØ¬Ø± Ø§Ù„Ø¹Ø§Ù…",
         "fields": [
-            {"key": "store_name",     "label": "اسم المتجر",    "ref": "store_name"},
-            {"key": "cart_btn_label", "label": "نص زر السلة",   "ref": "cart_btn_label"},
+            {"key": "store_name",     "label": "Ø§Ø³Ù… Ø§Ù„Ù…ØªØ¬Ø±",    "ref": "store_name"},
+            {"key": "cart_btn_label", "label": "Ù†Øµ Ø²Ø± Ø§Ù„Ø³Ù„Ø©",   "ref": "cart_btn_label"},
+            {"key": "lang",           "label": "Ø§Ù„Ù„ØºØ© (ar/en)", "ref": "lang"},
         ]
     },
     {
-        "section": "صفحة الدفع (Checkout)",
+        "section": "ØµÙØ­Ø© Ø§Ù„Ø¯ÙØ¹ (Checkout)",
         "fields": [
-            {"key": "checkout_title",               "label": "عنوان الصفحة",               "ref": "checkout_title"},
-            {"key": "checkout_back_btn",            "label": "زر الرجوع",                  "ref": "checkout_back_btn"},
-            {"key": "checkout_phone_label",         "label": "تسمية حقل رقم الهاتف",      "ref": "checkout_phone_label"},
-            {"key": "checkout_phone_placeholder",   "label": "نص توضيحي لحقل الهاتف",     "ref": "checkout_phone_placeholder"},
-            {"key": "checkout_address_label",       "label": "تسمية حقل العنوان",         "ref": "checkout_address_label"},
-            {"key": "checkout_address_placeholder", "label": "نص توضيحي لحقل العنوان",    "ref": "checkout_address_placeholder"},
-            {"key": "checkout_notes_label",         "label": "تسمية حقل الملاحظات",       "ref": "checkout_notes_label"},
-            {"key": "checkout_notes_placeholder",   "label": "نص توضيحي لحقل الملاحظات", "ref": "checkout_notes_placeholder"},
-            {"key": "checkout_confirm_btn",         "label": "نص زر تأكيد الطلب",         "ref": "checkout_confirm_btn"},
+            {"key": "checkout_title",               "label": "Ø¹Ù†ÙˆØ§Ù† Ø§Ù„ØµÙØ­Ø©",               "ref": "checkout_title"},
+            {"key": "checkout_back_btn",            "label": "Ø²Ø± Ø§Ù„Ø±Ø¬ÙˆØ¹",                  "ref": "checkout_back_btn"},
+            {"key": "checkout_phone_label",         "label": "ØªØ³Ù…ÙŠØ© Ø­Ù‚Ù„ Ø±Ù‚Ù… Ø§Ù„Ù‡Ø§ØªÙ",      "ref": "checkout_phone_label"},
+            {"key": "checkout_phone_placeholder",   "label": "Ù†Øµ ØªÙˆØ¶ÙŠØ­ÙŠ Ù„Ø­Ù‚Ù„ Ø§Ù„Ù‡Ø§ØªÙ",     "ref": "checkout_phone_placeholder"},
+            {"key": "checkout_address_label",       "label": "ØªØ³Ù…ÙŠØ© Ø­Ù‚Ù„ Ø§Ù„Ø¹Ù†ÙˆØ§Ù†",         "ref": "checkout_address_label"},
+            {"key": "checkout_address_placeholder", "label": "Ù†Øµ ØªÙˆØ¶ÙŠØ­ÙŠ Ù„Ø­Ù‚Ù„ Ø§Ù„Ø¹Ù†ÙˆØ§Ù†",    "ref": "checkout_address_placeholder"},
+            {"key": "checkout_notes_label",         "label": "ØªØ³Ù…ÙŠØ© Ø­Ù‚Ù„ Ø§Ù„Ù…Ù„Ø§Ø­Ø¸Ø§Øª",       "ref": "checkout_notes_label"},
+            {"key": "checkout_notes_placeholder",   "label": "Ù†Øµ ØªÙˆØ¶ÙŠØ­ÙŠ Ù„Ø­Ù‚Ù„ Ø§Ù„Ù…Ù„Ø§Ø­Ø¸Ø§Øª", "ref": "checkout_notes_placeholder"},
+            {"key": "checkout_confirm_btn",         "label": "Ù†Øµ Ø²Ø± ØªØ£ÙƒÙŠØ¯ Ø§Ù„Ø·Ù„Ø¨",         "ref": "checkout_confirm_btn"},
         ]
     },
     {
-        "section": "صفحة تأكيد الطلب",
+        "section": "ØµÙØ­Ø© ØªØ£ÙƒÙŠØ¯ Ø§Ù„Ø·Ù„Ø¨",
         "fields": [
-            {"key": "order_confirmed_title",    "label": "عنوان الصفحة",           "ref": "order_confirmed_title"},
-            {"key": "order_confirmed_msg",      "label": "رسالة التأكيد",          "ref": "order_confirmed_msg"},
-            {"key": "order_confirmed_redirect", "label": "رسالة إعادة التوجيه",    "ref": "order_confirmed_redirect"},
-            {"key": "order_confirmed_back_btn", "label": "نص زر العودة للمتجر",    "ref": "order_confirmed_back_btn"},
+            {"key": "order_confirmed_title",    "label": "Ø¹Ù†ÙˆØ§Ù† Ø§Ù„ØµÙØ­Ø©",           "ref": "order_confirmed_title"},
+            {"key": "order_confirmed_msg",      "label": "Ø±Ø³Ø§Ù„Ø© Ø§Ù„ØªØ£ÙƒÙŠØ¯",          "ref": "order_confirmed_msg"},
+            {"key": "order_confirmed_redirect", "label": "Ø±Ø³Ø§Ù„Ø© Ø¥Ø¹Ø§Ø¯Ø© Ø§Ù„ØªÙˆØ¬ÙŠÙ‡",    "ref": "order_confirmed_redirect"},
+            {"key": "order_confirmed_back_btn", "label": "Ù†Øµ Ø²Ø± Ø§Ù„Ø¹ÙˆØ¯Ø© Ù„Ù„Ù…ØªØ¬Ø±",    "ref": "order_confirmed_back_btn"},
         ]
     },
 ]
@@ -791,7 +1410,7 @@ SETTINGS_TEMPLATE = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>إعدادات النصوص</title>
+  <title>Ø¥Ø¹Ø¯Ø§Ø¯Ø§Øª Ø§Ù„Ù†ØµÙˆØµ</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
   <style>
@@ -819,11 +1438,11 @@ SETTINGS_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 <div class="topbar">
-  <h1>&#9881;&#65039; إعدادات النصوص</h1>
-  <a href="/dashboard">&#8594; العودة للوحة</a>
+  <h1>&#9881;&#65039; Ø¥Ø¹Ø¯Ø§Ø¯Ø§Øª Ø§Ù„Ù†ØµÙˆØµ</h1>
+  <a href="/dashboard">&#8594; Ø§Ù„Ø¹ÙˆØ¯Ø© Ù„Ù„ÙˆØ­Ø©</a>
 </div>
 <div class="page-wrap">
-  {% if saved %}<div class="alert alert-success mb-3" style="border-radius:12px;">تم حفظ الإعدادات بنجاح!</div>{% endif %}
+  {% if saved %}<div class="alert alert-success mb-3" style="border-radius:12px;">ØªÙ… Ø­ÙØ¸ Ø§Ù„Ø¥Ø¹Ø¯Ø§Ø¯Ø§Øª Ø¨Ù†Ø¬Ø§Ø­!</div>{% endif %}
   <form method="post">
     {% for section in sections %}
     <div class="section-card">
@@ -837,8 +1456,8 @@ SETTINGS_TEMPLATE = """<!DOCTYPE html>
     </div>
     {% endfor %}
     <div class="save-bar">
-      <span style="font-size:13px;color:#888;">التغييرات تنعكس فوراً على المتجر</span>
-      <button type="submit" class="save-btn">&#10003; حفظ الإعدادات</button>
+      <span style="font-size:13px;color:#888;">Ø§Ù„ØªØºÙŠÙŠØ±Ø§Øª ØªÙ†Ø¹ÙƒØ³ ÙÙˆØ±Ø§Ù‹ Ø¹Ù„Ù‰ Ø§Ù„Ù…ØªØ¬Ø±</span>
+      <button type="submit" class="save-btn">&#10003; Ø­ÙØ¸ Ø§Ù„Ø¥Ø¹Ø¯Ø§Ø¯Ø§Øª</button>
     </div>
   </form>
 </div>
@@ -1113,7 +1732,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 <td>
                   {% if o.latitude and o.longitude %}
                     <a class="map-link" href="https://www.google.com/maps?q={{ o.latitude }},{{ o.longitude }}" target="_blank">&#128205; Map</a>
-                  {% else %}<span style="color:#ccc;font-size:12px;">—</span>{% endif %}
+                  {% else %}<span style="color:#ccc;font-size:12px;">â€”</span>{% endif %}
                 </td>
                 <td style="white-space:pre-line;font-size:12px;max-width:180px;">{{ o.items }}</td>
                 <td><strong>{{ "%.0f"|format(o.total) }}</strong></td>
@@ -1205,15 +1824,15 @@ def dashboard():
     prods = []
     breadcrumb = []
     if selected_cat_id:
-        selected_cat = q("SELECT * FROM categories WHERE id=?", (selected_cat_id,), one=True)
+        selected_cat = q("SELECT * FROM categories WHERE id=%s", (selected_cat_id,), one=True)
     if selected_cat:
-        prods_raw = q("SELECT * FROM products WHERE category_id=? ORDER BY sort_order ASC, id ASC", (selected_cat_id,))
+        prods_raw = q("SELECT * FROM products WHERE category_id=%s ORDER BY sort_order ASC, id ASC", (selected_cat_id,))
         prods = []
         for p in prods_raw:
             pd = dict(p)
             pd["image_url"] = image_url(pd["image"]) if pd.get("image") else ""
             prods.append(pd)
-        cats_raw = q("SELECT * FROM categories WHERE parent_id=? ORDER BY sort_order ASC, id ASC", (selected_cat_id,))
+        cats_raw = q("SELECT * FROM categories WHERE parent_id=%s ORDER BY sort_order ASC, id ASC", (selected_cat_id,))
         cats = []
         for c in cats_raw:
             cd = dict(c)
@@ -1222,7 +1841,7 @@ def dashboard():
         cur = selected_cat
         while cur:
             breadcrumb.insert(0, {"id": cur["id"], "name": cur["name"]})
-            cur = q("SELECT * FROM categories WHERE id=?", (cur["parent_id"],), one=True) if cur["parent_id"] else None
+            cur = q("SELECT * FROM categories WHERE id=%s", (cur["parent_id"],), one=True) if cur["parent_id"] else None
     else:
         cats_raw = q("SELECT * FROM categories WHERE parent_id IS NULL ORDER BY sort_order ASC, id ASC")
         cats = []
@@ -1262,7 +1881,7 @@ def design():
             d = q("SELECT * FROM design ORDER BY id DESC LIMIT 1", one=True)
             if d:
                 bg = bg or d["background"]; ov = ov or d["overlay"]; an = an or d["animation"]
-            q("INSERT INTO design(background, overlay, animation) VALUES(?,?,?)", (bg, ov, an))
+            q("INSERT INTO design(background, overlay, animation) VALUES(%s,%s,%s)", (bg, ov, an))
         return redirect("/design")
     d = q("SELECT * FROM design ORDER BY id DESC LIMIT 1", one=True)
     bg_url = image_url(d["background"]) if d and d["background"] else ""
@@ -1294,10 +1913,10 @@ def edit_cat(id):
     if not require_admin(): return redirect("/admin")
     name = request.form.get("name","").strip()
     if not name: return redirect("/dashboard")
-    cat = q("SELECT * FROM categories WHERE id=?", (id,), one=True)
+    cat = q("SELECT * FROM categories WHERE id=%s", (id,), one=True)
     img = save(request.files.get("image"))
-    if img: q("UPDATE categories SET name=?, image=? WHERE id=?", (name, img, id))
-    else:   q("UPDATE categories SET name=? WHERE id=?", (name, id))
+    if img: q("UPDATE categories SET name=%s, image=%s WHERE id=%s", (name, img, id))
+    else:   q("UPDATE categories SET name=%s WHERE id=%s", (name, id))
     parent_id = cat["parent_id"] if cat else None
     return redirect(f"/dashboard?cat={parent_id}" if parent_id else "/dashboard")
 
@@ -1312,8 +1931,8 @@ def edit_prod(id):
     except ValueError: return redirect("/dashboard")
     if not name or not cat_id: return redirect("/dashboard")
     img = save(request.files.get("image"))
-    if img: q("UPDATE products SET name=?, price=?, image=?, category_id=? WHERE id=?", (name, price, img, cat_id, id))
-    else:   q("UPDATE products SET name=?, price=?, category_id=? WHERE id=?", (name, price, cat_id, id))
+    if img: q("UPDATE products SET name=%s, price=%s, image=%s, category_id=%s WHERE id=%s", (name, price, img, cat_id, id))
+    else:   q("UPDATE products SET name=%s, price=%s, category_id=%s WHERE id=%s", (name, price, cat_id, id))
     return redirect(f"/dashboard?cat={cat_id}")
 
 @app.route("/add_cat", methods=["POST"])
@@ -1326,9 +1945,9 @@ def add_cat():
     if parent_id is None:
         max_order = q("SELECT MAX(sort_order) as m FROM categories WHERE parent_id IS NULL", one=True)
     else:
-        max_order = q("SELECT MAX(sort_order) as m FROM categories WHERE parent_id=?", (parent_id,), one=True)
+        max_order = q("SELECT MAX(sort_order) as m FROM categories WHERE parent_id=%s", (parent_id,), one=True)
     new_order = (max_order["m"] or 0) + 1
-    q("INSERT INTO categories(name, image, parent_id, sort_order) VALUES(?,?,?,?)",
+    q("INSERT INTO categories(name, image, parent_id, sort_order) VALUES(%s,%s,%s,%s)",
       (name, save(request.files.get("image")), parent_id, new_order))
     return redirect(f"/dashboard?cat={parent_id}" if parent_id else "/dashboard")
 
@@ -1342,29 +1961,29 @@ def add_prod():
         if price < 0: raise ValueError
     except ValueError: return redirect("/dashboard")
     if not name or not cat_id: return redirect("/dashboard")
-    max_order = q("SELECT MAX(sort_order) as m FROM products WHERE category_id=?", (cat_id,), one=True)
+    max_order = q("SELECT MAX(sort_order) as m FROM products WHERE category_id=%s", (cat_id,), one=True)
     new_order = (max_order["m"] or 0) + 1
-    q("INSERT INTO products(name, price, image, category_id, sort_order) VALUES(?,?,?,?,?)",
+    q("INSERT INTO products(name, price, image, category_id, sort_order) VALUES(%s,%s,%s,%s,%s)",
       (name, price, save(request.files.get("image")), cat_id, new_order))
     return redirect(f"/dashboard?cat={cat_id}")
 
 @app.route("/delete_cat/<int:id>", methods=["POST"])
 def del_cat(id):
     if not require_admin(): return redirect("/admin")
-    cat = q("SELECT * FROM categories WHERE id=?", (id,), one=True)
+    cat = q("SELECT * FROM categories WHERE id=%s", (id,), one=True)
     parent_id = cat["parent_id"] if cat else None
     def delete_recursive(cid):
-        for sub in q("SELECT id FROM categories WHERE parent_id=?", (cid,)): delete_recursive(sub["id"])
-        q("DELETE FROM products WHERE category_id=?", (cid,))
-        q("DELETE FROM categories WHERE id=?", (cid,))
+        for sub in q("SELECT id FROM categories WHERE parent_id=%s", (cid,)): delete_recursive(sub["id"])
+        q("DELETE FROM products WHERE category_id=%s", (cid,))
+        q("DELETE FROM categories WHERE id=%s", (cid,))
     delete_recursive(id)
     return redirect(f"/dashboard?cat={parent_id}" if parent_id else "/dashboard")
 
 @app.route("/delete_prod/<int:id>", methods=["POST"])
 def del_prod(id):
     if not require_admin(): return redirect("/admin")
-    p = q("SELECT category_id FROM products WHERE id=?", (id,), one=True)
-    q("DELETE FROM products WHERE id=?", (id,))
+    p = q("SELECT category_id FROM products WHERE id=%s", (id,), one=True)
+    q("DELETE FROM products WHERE id=%s", (id,))
     cat_id = p["category_id"] if p else None
     return redirect(f"/dashboard?cat={cat_id}" if cat_id else "/dashboard")
 
@@ -1374,7 +1993,7 @@ def del_prod(id):
 @app.route("/order/<int:id>/download")
 def download_order(id):
     if not require_admin(): return redirect("/admin")
-    o = q("SELECT * FROM orders WHERE id=?", (id,), one=True)
+    o = q("SELECT * FROM orders WHERE id=%s", (id,), one=True)
     if not o: return redirect("/dashboard")
     order_dict = dict(o)
     png_buf = generate_order_png(order_dict)
@@ -1387,7 +2006,7 @@ def download_order(id):
 @app.route("/delete_order/<int:id>", methods=["POST"])
 def del_order(id):
     if not require_admin(): return redirect("/admin")
-    q("DELETE FROM orders WHERE id=?", (id,))
+    q("DELETE FROM orders WHERE id=%s", (id,))
     return redirect("/dashboard")
 
 # ============================================================
@@ -1396,7 +2015,7 @@ def del_order(id):
 @app.route("/admin/database")
 def admin_database():
     if not require_admin(): return redirect("/admin")
-    cloud_name = os.environ.get("CLOUDINARY_CLOUD_NAME", "—")
+    cloud_name = os.environ.get("CLOUDINARY_CLOUD_NAME", "â€”")
     db_url_masked = DATABASE_URL[:40] + "..." if len(DATABASE_URL) > 40 else DATABASE_URL
     return render_template_string("""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1405,15 +2024,15 @@ def admin_database():
 </head><body>
 <div class="container mt-5" style="max-width:540px">
   <div class="d-flex justify-content-between align-items-center mb-4">
-    <h4>🗄️ Database & Storage</h4>
+    <h4>&#128506;&#65039; Database & Storage</h4>
     <a href="/dashboard" class="btn btn-secondary btn-sm">Back</a>
   </div>
   <div class="alert alert-success">
-    ✅ Database connected to <strong>Neon PostgreSQL</strong><br>
+    &#9989; Database connected to <strong>Neon PostgreSQL</strong><br>
     <small class="text-muted">{{ db_url }}</small>
   </div>
   <div class="alert alert-info">
-    🖼️ Images stored on <strong>Cloudinary</strong><br>
+    &#128444;&#65039; Images stored on <strong>Cloudinary</strong><br>
     <small class="text-muted">Cloud name: <strong>{{ cloud_name }}</strong></small>
   </div>
   <div class="d-grid gap-2">
